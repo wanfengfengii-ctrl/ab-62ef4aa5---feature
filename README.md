@@ -12,6 +12,10 @@
 逐时隙选最低能耗可能把反作用轮动量推出安全边界，因此规划器使用前向动态规划
 在整个窗口上求全局最优，而非逐时隙贪心。
 
+在轨执行中实测动量偏离原计划时，可通过
+`POST /api/momentum-plans/recompile` 保留已下发指令、固定已执行前缀，从
+最新遥测动量只为剩余时隙重编（末态仍进入原目标域）。
+
 ## 目录结构
 
 ```
@@ -127,6 +131,64 @@ uvicorn app.main:app --reload
 
 `reason` 为 `target_unreachable` 时表示整窗安全域内均可达但末态无人进入
 目标矩形（此时 `last_reachable_slot` 等于总时隙数）。
+
+### 余窗重编（在轨执行中从最新遥测重编）
+
+`POST /api/momentum-plans/recompile`
+
+在轨执行中实测动量可能偏离原计划轨迹。重编接口保留已经下发的指令，固定已
+执行前缀，只从最新遥测状态为剩余时隙重新选择指令。请求包含原编译请求、已
+执行编号序列与观测动量：
+
+```json
+{
+  "original_request": { "...": "与 /compile 请求体完全相同" },
+  "executed_command_ids": [1, 2, 1],
+  "observed_momentum": [2, 1]
+}
+```
+
+约束与语义：
+
+- `executed_command_ids` 依次对应前 k 个时隙（1 ≤ k ≤ 总时隙数−1），每个
+  编号必须属于对应时隙的候选指令集合；编号仅要求时隙内唯一，**跨时隙复用
+  同一编号是合法的**（每时隙恰好执行一条，原计划的并列裁决也可能产出
+  `[3,3,3,...]`）；时隙内编号重复属于原请求自相矛盾，按 422 拒绝。
+- `observed_momentum` 必须位于安全域；后缀的安全演化从该观测动量继续，
+  末态仍须进入**原目标域**。
+- 前缀的能耗、模式切换次数与编号序列被折叠进整窗目标：`objectives` 覆盖
+  完整窗口，前后缀**交界处**模式不同也计一次切换；`selected`/`momentums`
+  只覆盖被重编的剩余时隙，槽位编号沿用原窗口（从 `replanned_from_slot`
+  开始）。
+
+成功响应（200）沿用原计划结构，并标明重编起点与观测动量：
+
+```json
+{
+  "feasible": true,
+  "slot_count": 8,
+  "selected": [ {"slot": 4, "...": "..."} ],
+  "momentums": [[2, 1]],
+  "final_momentum": [1, 0],
+  "objectives": {
+    "total_energy": 9.5,
+    "mode_switches": 2,
+    "command_id_sequence": [1, 2, 1, 2, 1, 2, 1, 2]
+  },
+  "replanned_from_slot": 4,
+  "observed_momentum": [2, 1]
+}
+```
+
+重编错误区分：
+
+- **422 参数错误**：前缀为空或覆盖全部时隙、编号不属于对应时隙
+  （定位到 `executed_command_ids[i]`）、观测动量在安全域外
+  （`observed_momentum`），或原请求本身不合法
+  （定位到 `original_request.<字段>`）。
+- **409 无安全后缀**：前缀合法但从观测状态已不存在进入原目标域的安全
+  后缀，响应以**原窗口时隙编号**报告 `last_reachable_slot` 与该层
+  `reachable_states`（与编译接口同一错误体）。
 
 ## 算法要点
 

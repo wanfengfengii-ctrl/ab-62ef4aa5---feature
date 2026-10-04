@@ -78,3 +78,27 @@ class CompileResponse(StrictModel):
     momentums: list[IntVec]
     final_momentum: IntVec
     objectives: Objectives
+
+
+class RecompileRequest(StrictModel):
+    """余窗重编请求：原编译请求 + 已执行前缀 + 最新遥测动量。"""
+
+    original_request: CompileRequest = Field(description="原编译请求，裁决规则保持不变")
+    executed_command_ids: list[int] = Field(
+        min_length=1,
+        description="已执行指令编号，依次对应前 k 个时隙（1 <= k <= 总时隙数-1）",
+    )
+    observed_momentum: IntVec = Field(
+        description="执行完前缀后的遥测动量，必须位于安全域"
+    )
+
+
+class RecompileResponse(CompileResponse):
+    """余窗重编响应：沿用原计划结构，另标明重编起点与观测动量。
+
+    ``selected``/``momentums`` 只覆盖被重编的剩余时隙（槽位编号沿用原窗口），
+    但 ``objectives`` 折叠已执行前缀代价，覆盖完整窗口。
+    """
+
+    replanned_from_slot: int = Field(description="剩余窗口起始时隙编号（1 基）")
+    observed_momentum: IntVec

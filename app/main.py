@@ -4,9 +4,9 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
-from .models import CompileRequest, CompileResponse
-from .planner import InfeasiblePlanError, compile_plan
-from .validation import SemanticError, validate_semantics
+from .models import CompileRequest, CompileResponse, RecompileRequest, RecompileResponse
+from .planner import InfeasiblePlanError, compile_plan, recompile_plan
+from .validation import SemanticError, validate_recompile, validate_semantics
 
 app = FastAPI(
     title="动量卸载整窗计划编译服务",
@@ -72,3 +72,26 @@ async def health() -> dict:
 async def compile_momentum_plan(request: CompileRequest) -> dict:
     validate_semantics(request)
     return compile_plan(request)
+
+
+@app.post("/api/momentum-plans/recompile", response_model=RecompileResponse)
+async def recompile_momentum_plan(request: RecompileRequest) -> dict:
+    validate_recompile(request)
+
+    original = request.original_request
+    ids = request.executed_command_ids
+    k = len(ids)
+
+    # 校验已保证每个编号属于对应时隙；取回已执行指令对象（保留模式与能耗）。
+    prefix_commands = []
+    for i, cid in enumerate(ids):
+        cmd = next(c for c in original.slots[i].commands if c.id == cid)
+        prefix_commands.append(cmd)
+
+    observed = tuple(request.observed_momentum)
+    return recompile_plan(
+        request=original,
+        prefix_commands=prefix_commands,
+        observed=observed,  # type: ignore[arg-type]
+        replanned_from_slot=k + 1,
+    )

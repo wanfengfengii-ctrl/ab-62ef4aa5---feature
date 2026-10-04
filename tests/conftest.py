@@ -81,6 +81,55 @@ def brute_force_best(req: dict):
     return best
 
 
+def brute_force_recompile(req: dict, executed_ids, observed):
+    """余窗重编的独立穷举参考：固定前缀代价，从观测动量穷举剩余时隙。
+
+    前缀的能耗/切换/末模式折叠进根标签，前后缀交界的模式切换照常计入。
+    返回 (energy, switches, ids) 或 None。
+    """
+    safety = req["safety_region"]
+    target = req["target_region"]
+    k = len(executed_ids)
+
+    def in_rect(q, r):
+        return r["x_min"] <= q[0] <= r["x_max"] and r["y_min"] <= q[1] <= r["y_max"]
+
+    energy = 0.0
+    switches = 0
+    prev_mode = None
+    for i, cid in enumerate(executed_ids):
+        cmd = next(c for c in req["slots"][i]["commands"] if c["id"] == cid)
+        energy += cmd["energy"]
+        if prev_mode is not None and prev_mode != cmd["mode"]:
+            switches += 1
+        prev_mode = cmd["mode"]
+
+    prefix_label = (energy, switches, prev_mode, list(executed_ids))
+    suffix_slots = req["slots"][k:]
+    best = None
+    for combo in itertools.product(*(s["commands"] for s in suffix_slots)):
+        state = tuple(observed)
+        e, sw, pm, ids = prefix_label[0], prefix_label[1], prefix_label[2], list(prefix_label[3])
+        ok = True
+        for s, cmd in zip(suffix_slots, combo):
+            d = s["disturbance"]
+            c = cmd["correction"]
+            state = (state[0] + d[0] + c[0], state[1] + d[1] + c[1])
+            if not in_rect(state, safety):
+                ok = False
+                break
+            e += cmd["energy"]
+            if pm is not None and pm != cmd["mode"]:
+                sw += 1
+            pm = cmd["mode"]
+            ids.append(cmd["id"])
+        if ok and in_rect(state, target):
+            label = (e, sw, tuple(ids))
+            if best is None or label < best:
+                best = label
+    return best
+
+
 def eight_slots():
     """固定 8 时隙基础场景：两个模式各两条指令。"""
     return [
