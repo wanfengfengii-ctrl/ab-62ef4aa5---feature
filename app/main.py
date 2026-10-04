@@ -4,9 +4,9 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
-from .models import CompileRequest, CompileResponse
-from .planner import InfeasiblePlanError, compile_plan
-from .validation import SemanticError, validate_semantics
+from .models import CompileRequest, CompileResponse, RecompileRequest, RecompileResponse
+from .planner import InfeasiblePlanError, compile_plan, recompile_plan
+from .validation import SemanticError, validate_recompile, validate_semantics
 
 app = FastAPI(
     title="动量卸载整窗计划编译服务",
@@ -72,3 +72,13 @@ async def health() -> dict:
 async def compile_momentum_plan(request: CompileRequest) -> dict:
     validate_semantics(request)
     return compile_plan(request)
+
+
+@app.post("/api/momentum-plans/recompile", response_model=RecompileResponse)
+async def recompile_momentum_plan(request: RecompileRequest) -> dict:
+    validate_recompile(request)
+    return recompile_plan(
+        request.request,
+        request.executed_command_ids,
+        tuple(request.observed_momentum),
+    )

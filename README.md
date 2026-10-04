@@ -18,9 +18,9 @@
 app/                 FastAPI 应用
   main.py            路由与错误处理（422 参数错误 / 409 真实无解）
   models.py          Pydantic 请求/响应模型
-  planner.py         整窗动态规划与无解诊断
+  planner.py         整窗动态规划与无解诊断（含在轨余窗重编）
   validation.py      跨字段语义校验（定位到字段）
-tests/               pytest 测试（含 60 组随机穷举对拍）
+tests/               pytest 测试（含 60 组整窗 + 80 组余窗随机穷举对拍）
 scripts/verify.py    Compose verify 服务的一次性核验脚本
 Dockerfile           runtime / verify 多目标镜像
 docker-compose.yml   api（带健康检查）+ verify（一次性）
@@ -127,6 +127,64 @@ uvicorn app.main:app --reload
 
 `reason` 为 `target_unreachable` 时表示整窗安全域内均可达但末态无人进入
 目标矩形（此时 `last_reachable_slot` 等于总时隙数）。
+
+### 在轨余窗重编
+
+`POST /api/momentum-plans/recompile`
+
+在轨执行中实测动量偏离原计划轨迹时，**保留已经下发的指令**，从最新遥测
+状态重编剩余窗口。请求携带原编译请求、已执行前缀的指令编号（按时隙顺序）
+与观测动量：
+
+```json
+{
+  "request": { "…": "与 /compile 请求体完全相同" },
+  "executed_command_ids": [1, 2, 1],
+  "observed_momentum": [3, -1]
+}
+```
+
+约束：
+
+- `executed_command_ids` 长度 k 满足 **1 ≤ k ≤ 总时隙数 − 1**，且第 i 个编号
+  必须属于原请求第 i 个时隙的候选指令（编号只要求时隙内唯一，跨隙重号合法）；
+  编号缺失（全窗口不存在）或不属于对应时隙均返回 **422** 并定位到
+  `executed_command_ids[i]`；
+- `observed_momentum` 必须位于统一安全域，否则 422 定位到
+  `observed_momentum`；嵌套原请求自身的语义错误以 `request.` 前缀定位
+  （如 `request.initial_momentum`）。
+
+规划语义：
+
+- 前 k 个时隙的指令**固定不变**，动态规划只为第 k+1 … T 时隙重新选择指令；
+- 安全演化从观测动量继续（`p_{k+1} = observed + disturbance + correction`），
+  末态仍须进入**原目标域**；
+- 总能耗、模式切换次数、指令编号序列均覆盖**完整窗口**，前后缀交界模式
+  不同也计一次切换；
+- 响应沿用原计划结构，额外标明 `replanned_from_slot`（= k+1）与
+  `observed_momentum`；`momentums` 前 k-1 项为原模型重放、第 k 项为观测值，
+  其后从观测点连续演化。
+
+```json
+{
+  "feasible": true,
+  "slot_count": 8,
+  "selected": ["…完整 8 隙，前 k 项为已执行指令…"],
+  "momentums": ["…完整 8 隙，第 k 项即观测动量…"],
+  "final_momentum": [0, 0],
+  "objectives": {
+    "total_energy": 9.5,
+    "mode_switches": 1,
+    "command_id_sequence": [1, 2, 1, 2, 1, 1, 2, 1]
+  },
+  "replanned_from_slot": 4,
+  "observed_momentum": [3, -1]
+}
+```
+
+合法前缀但从观测状态已无安全后缀时返回 **409**，诊断字段沿用无解契约，
+且 `last_reachable_slot`、`reachable_states` 以**原窗口时隙编号**报告
+（余窗第一步即被切断时 `last_reachable_slot` = k，可达状态数为 1）。
 
 ## 算法要点
 

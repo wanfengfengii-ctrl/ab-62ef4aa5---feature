@@ -5,7 +5,8 @@
   2. 核对代码测试（pytest 全套）；
   3. 核对镜像构建契约（非 root、应用与工具链可导入、健康端点契约）；
   4. 业务冒烟：可行计划、并列裁决（三级目标）、真实无解诊断、
-     以及参数错误与无解的区分。
+     参数错误与无解的区分，以及余窗重编（前缀固定、观测续演、
+     422 前缀/观测非法与 409 无安全后缀的区分）。
 """
 
 import json
@@ -23,6 +24,7 @@ if _PROJECT_ROOT not in sys.path:
 
 API_BASE = os.environ.get("API_BASE_URL", "http://api:8000")
 COMPILE_URL = f"{API_BASE}/api/momentum-plans/compile"
+RECOMPILE_URL = f"{API_BASE}/api/momentum-plans/recompile"
 HEALTH_URL = f"{API_BASE}/health"
 
 
@@ -115,7 +117,7 @@ def smoke_feasible() -> bool:
     if tuple(data["final_momentum"]) != tuple(data["momentums"][-1]):
         ok = False
 
-    _log(ok, "业务冒烟 1/4：可行计划（选择、逐隙动量、三项目标）")
+    _log(ok, "业务冒烟 1/5：可行计划（选择、逐隙动量、三项目标）")
     return ok
 
 
@@ -132,7 +134,7 @@ def smoke_tie_breaking() -> bool:
         and data["objectives"]["mode_switches"] == 0
         and data["objectives"]["command_id_sequence"] == [3] * 8
     )
-    _log(ok, f"业务冒烟 2/4：并列裁决（能耗→切换数→编号序列） 实际目标={data.get('objectives') if status == 200 else data}")
+    _log(ok, f"业务冒烟 2/5：并列裁决（能耗→切换数→编号序列） 实际目标={data.get('objectives') if status == 200 else data}")
     return ok
 
 
@@ -156,7 +158,7 @@ def smoke_infeasible() -> bool:
     )
     _log(
         ok,
-        f"业务冒烟 3/4：真实无解诊断（409、最后可达时隙、可达状态数） 实际 {status}: {data if not ok else 'last_reachable_slot=0, reachable_states=1'}",
+        f"业务冒烟 3/5：真实无解诊断（409、最后可达时隙、可达状态数） 实际 {status}: {data if not ok else 'last_reachable_slot=0, reachable_states=1'}",
     )
     return ok
 
@@ -175,9 +177,125 @@ def smoke_param_error() -> bool:
     )
     _log(
         ok and located,
-        f"业务冒烟 4/4：参数错误定位字段（422，区别于 409） 实际 {status}: {data}",
+        f"业务冒烟 4/5：参数错误定位字段（422，区别于 409） 实际 {status}: {data}",
     )
     return ok and located
+
+
+def smoke_recompile() -> bool:
+    """余窗重编：固定已执行前缀、从观测动量续演，422/409 区分。"""
+    ok = True
+    detail = ""
+
+    # 场景一：全程零扰动、两条同能耗同修正指令；前缀 [1,1,1]、观测仍在原点。
+    # 后缀应按三级裁决继续选 id=1，整窗序列 [1]*8、零切换、能耗 8。
+    slots = [
+        _slot((0, 0), (1, "A", (0, 0), 1.0), (2, "B", (0, 0), 1.0))
+    ] * 8
+    body = _base_body(slots)
+    status, data = _post_json(
+        RECOMPILE_URL,
+        {
+            "request": body,
+            "executed_command_ids": [1, 1, 1],
+            "observed_momentum": [0, 0],
+        },
+    )
+    if status != 200:
+        ok = False
+        detail = f"重编应返回 200，实际 {status}: {data}"
+    else:
+        obj = data["objectives"]
+        checks = [
+            data.get("replanned_from_slot") == 4,
+            data.get("observed_momentum") == [0, 0],
+            obj.get("command_id_sequence") == [1] * 8,
+            obj.get("mode_switches") == 0,
+            obj.get("total_energy") == 8.0,
+            len(data.get("selected", [])) == 8,
+            [s["command_id"] for s in data["selected"][:3]] == [1, 1, 1],
+            data.get("momentums", [None] * 4)[2] == [0, 0],
+        ]
+        if not all(checks):
+            ok = False
+            detail = f"重编计划/目标字段不符：{data}"
+
+        # 后缀连续演化复核：从观测动量起逐隙 p += 扰动 + 修正。
+        state = (0, 0)
+        for i in range(3, 8):
+            sel = data["selected"][i]
+            d = slots[i]["disturbance"]
+            state = (
+                state[0] + d[0] + sel["correction"][0],
+                state[1] + d[1] + sel["correction"][1],
+            )
+            if list(state) != data["momentums"][i]:
+                ok = False
+                detail = f"后缀第 {i + 1} 隙动量未从观测点连续演化：{data}"
+
+    # 场景二：前缀编号不存在 → 422 并定位字段。
+    bad_status, bad_data = _post_json(
+        RECOMPILE_URL,
+        {
+            "request": _base_body(slots),
+            "executed_command_ids": [99],
+            "observed_momentum": [0, 0],
+        },
+    )
+    if not (
+        bad_status == 422
+        and bad_data.get("field") == "executed_command_ids[0]"
+    ):
+        ok = False
+        detail = f"前缀编号缺失应 422 定位字段，实际 {bad_status}: {bad_data}"
+
+    # 场景三：观测动量在安全域外 → 422。
+    obs_status, obs_data = _post_json(
+        RECOMPILE_URL,
+        {
+            "request": _base_body(slots),
+            "executed_command_ids": [1],
+            "observed_momentum": [101, 0],
+        },
+    )
+    if obs_status != 422 or obs_data.get("field") != "observed_momentum":
+        ok = False
+        detail = f"观测动量越界应 422，实际 {obs_status}: {obs_data}"
+
+    # 场景四：合法前缀与观测，但余窗第一步即被安全域切断 → 409，
+    # last_reachable_slot 以原窗口编号报告（等于前缀长度 4）。
+    cut_slots = [
+        _slot((0, 0), (1, "A", (0, 0), 1.0), (2, "B", (0, 0), 2.0))
+    ] * 4 + [
+        _slot((1, 0), (1, "A", (0, 0), 1.0), (2, "B", (1, 0), 1.0))
+    ] * 4
+    cut_body = _base_body(
+        cut_slots,
+        safety={"x_min": 0, "x_max": 2, "y_min": -1, "y_max": 1},
+        target={"x_min": 0, "x_max": 2, "y_min": 0, "y_max": 1},
+    )
+    cut_status, cut_data = _post_json(
+        RECOMPILE_URL,
+        {
+            "request": cut_body,
+            "executed_command_ids": [1, 1, 1, 1],
+            "observed_momentum": [2, 0],
+        },
+    )
+    if not (
+        cut_status == 409
+        and cut_data.get("error") == "no_feasible_plan"
+        and cut_data.get("last_reachable_slot") == 4
+        and cut_data.get("reachable_states") == 1
+    ):
+        ok = False
+        detail = f"无安全后缀应 409 并以原窗口编号报告，实际 {cut_status}: {cut_data}"
+
+    _log(
+        ok,
+        f"业务冒烟 5/5：余窗重编（前缀固定、观测续演、422/409 区分） {detail}",
+    )
+    return ok
 
 
 def image_contract() -> bool:
@@ -220,6 +338,7 @@ def main() -> int:
         smoke_tie_breaking(),
         smoke_infeasible(),
         smoke_param_error(),
+        smoke_recompile(),
     ]
     print("\n=== 核验汇总 ===")
     print(f"通过 {sum(results)}/{len(results)} 项")
